@@ -1,0 +1,607 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cooking Game (First Person)</title>
+  <style>
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body { margin: 0; font-family: system-ui, sans-serif; background: #2a1d10; color: #3a2a1a; display: flex; flex-direction: column; overflow: hidden; }
+header { display: flex; justify-content: space-between; align-items: center; padding: 8px 16px; background: #e8743b; color: #fff; flex: none; }
+header h1 { margin: 0; font-size: 1.2rem; }
+.stats span { margin-left: 18px; font-size: 1.05rem; }
+button { font: inherit; cursor: pointer; border: 0; border-radius: 8px; padding: 6px 12px; background: #3a2a1a; color: #fff; }
+button:hover { filter: brightness(1.2); }
+#start-top { margin-left: 18px; background: #fff; color: #e8743b; font-weight: bold; }
+nav { display: flex; gap: 6px; flex-wrap: wrap; padding: 6px 16px; background: #3a2a1a; flex: none; }
+nav button { background: #6e4a26; padding: 4px 10px; font-size: .9rem; }
+#wrap { position: relative; flex: 1; min-height: 0; }
+#view { position: absolute; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+
+#overlay { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: flex; align-items: center; justify-content: center; }
+#overlay.hidden { display: none; }
+.card { background: #fff; padding: 24px 32px; border-radius: 14px; text-align: center; max-width: 400px; }
+.card h2 { margin: 0 0 8px; }
+.card small { display: block; margin: 8px 0 14px; opacity: .7; line-height: 1.4; }
+.toast { position: fixed; bottom: 130px; left: 50%; transform: translateX(-50%); background: #3a2a1a; color: #fff; padding: 8px 16px; border-radius: 20px; pointer-events: none; }
+</style>
+</head>
+<body>
+  <header>
+    <h1>🍳 Cooking Game</h1>
+    <div class="stats">
+      <span>Score: <b id="score">0</b></span>
+      <button id="start-top">Start</button>
+    </div>
+  </header>
+
+  <nav id="nav">
+    <button data-key="1">1 Pantry</button>
+    <button data-key="2">2 Cutting board</button>
+    <button data-key="3">3 Pan</button>
+    <button data-key="4">4 Blowtorch</button>
+    <button data-key="5">5 Serving window</button>
+    <button data-key="6">6 Bin</button>
+  </nav>
+
+  <div id="wrap"><canvas id="view"></canvas></div>
+
+  <div id="overlay">
+    <div class="card">
+      <h2 id="overlay-title">Cooking Game</h2>
+      <p id="overlay-text">Prep ingredients, fill the tray, and serve customers at the window before they lose patience.</p>
+      <small>Look around: move the mouse to the screen edges, A/D or arrow keys.<br>
+        Jump to a station: keys 1-6 or the buttons above. C clears the tray.</small>
+      <button id="start">Start</button>
+    </div>
+  </div>
+
+  <script>
+// ---- Game content: edit this file to make your own game ----
+
+const CONFIG = {
+  pointsPerUnlock: 100,    // every this many points unlocks the next tier of ingredients
+  orderEverySeconds: 10,
+  maxOrders: 4,
+  orderPatienceSeconds: 40,
+  cookSeconds: 5,          // time for the pan to go from raw to burnt (see GOOD_ZONE)
+  chopClicks: 3,
+  pointsPerItem: 10,
+  wrongPenalty: 5,
+};
+
+// Fraction of cook time that counts as "perfectly cooked"
+const GOOD_ZONE = [0.4, 0.75];
+
+// Cooking stations. "seconds" = time from raw to burnt (the green zone scales with it).
+const COOKERS = {
+  pan:   { name: "Pan",       seconds: 5 },
+  torch: { name: "Blowtorch", seconds: 2.5 },
+};
+
+// prep: "none" (straight to tray), "chop" (cutting board), "cook" (pan, or blowtorch if torch:true)
+// unlockRound: which tier it unlocks at (0 = from the start; each tier takes CONFIG.pointsPerUnlock points)
+const INGREDIENTS = {
+  bun:     { emoji: "🍞", name: "Bun",     prep: "none", unlockRound: 0 },
+  patty:   { emoji: "🥩", name: "Patty",   prep: "cook", torch: true, unlockRound: 0 },
+  lettuce: { emoji: "🥬", name: "Lettuce", prep: "chop", unlockRound: 0 },
+  cheese:  { emoji: "🧀", name: "Cheese",  prep: "none", unlockRound: 1 },
+  tomato:  { emoji: "🍅", name: "Tomato",  prep: "chop", unlockRound: 2 },
+  egg:     { emoji: "🥚", name: "Egg",     prep: "cook", unlockRound: 3 },
+  bacon:   { emoji: "🥓", name: "Bacon",   prep: "cook", torch: true, unlockRound: 4 },
+  onion:   { emoji: "🧅", name: "Onion",   prep: "chop", unlockRound: 5 },
+};
+
+// Items use the form "ingredient" (no prep needed) or "ingredient:state"
+// where state is "chopped" or "cooked". A recipe only appears once all its ingredients are unlocked.
+const RECIPES = [
+  { name: "Burger",       bonus: 10, items: ["bun", "patty:cooked", "lettuce:chopped"] },
+  { name: "Cheeseburger", bonus: 15, items: ["bun", "patty:cooked", "cheese"] },
+  { name: "Salad",        bonus: 5,  items: ["lettuce:chopped", "tomato:chopped"] },
+  { name: "Egg Toast",    bonus: 10, items: ["bun", "egg:cooked"] },
+  { name: "BLT",          bonus: 20, items: ["bun", "bacon:cooked", "lettuce:chopped", "tomato:chopped"] },
+  { name: "Onion Burger", bonus: 20, items: ["bun", "patty:cooked", "onion:chopped", "cheese"] },
+];
+</script>
+  <script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const cv = $("view"), ctx = cv.getContext("2d");
+  const state = { running: false, knife: false, score: 0, orders: [], tray: [], board: null, cookers: { pan: null, torch: null }, nextId: 1 };
+  let spawnTimer = 0;
+
+  // ---------- world layout (angles in degrees around the player) ----------
+  const FOV = 90;                       // degrees visible at once
+  const YAW_MIN = -110, YAW_MAX = 140;  // how far you can turn
+  const SLOTS = 4;                      // customers at the window
+  const AT = { bin: -108, pantry: -70, board: -20, pan: 25, torch: 60, window: 112 };
+  const SPOTS = { "1": AT.pantry, "2": AT.board, "3": AT.pan, "4": AT.torch, "5": AT.window, "6": AT.bin };
+  const SKIN = "#f0c08a";
+  const CUSTOMER_COLORS = ["#c0392b", "#2980b9", "#8e44ad", "#16a085", "#d35400"];
+
+  // ---------- camera / input state ----------
+  let W = 0, H = 0, ppd = 0, u = 1, dpr = 1;     // canvas size, pixels per degree, 1% of height
+  let yaw = 0, yawTarget = null, kick = 0;
+  const mouse = { x: 0, y: 0, inside: false };
+  const keys = { left: false, right: false };
+  let hits = [], hoverLabel = "";
+  const clampYaw = (v) => Math.max(YAW_MIN, Math.min(YAW_MAX, v));
+  const sx = (a) => W / 2 + (a - yaw) * ppd;
+
+  // ---------- progress (rounds completed, saved in the browser) ----------
+  let rounds = 0;
+  try { rounds = parseInt(localStorage.getItem("cookingRounds") || "0", 10) || 0; } catch (e) {}
+  const saveRounds = () => { try { localStorage.setItem("cookingRounds", rounds); } catch (e) {} };
+  const unlocked = (id, r = rounds) => INGREDIENTS[id].unlockRound <= r;
+  const availableRecipes = () => RECIPES.filter((rc) => rc.items.every((i) => unlocked(i.split(":")[0])));
+
+  // ---------- helpers ----------
+  const label = (key) => {
+    const [id, st] = key.split(":");
+    const ing = INGREDIENTS[id];
+    return `${ing.emoji} ${st ? st + " " : ""}${ing.name}`;
+  };
+  const toast = (msg) => {
+    const t = document.createElement("div");
+    t.className = "toast"; t.textContent = msg;
+    document.body.appendChild(t);
+    setTimeout(() => t.remove(), 1200);
+  };
+  const addScore = (n) => {
+    state.score = Math.max(0, state.score + n);
+    const tier = Math.floor(state.score / CONFIG.pointsPerUnlock);
+    if (tier > rounds) {
+      const before = rounds;
+      rounds = tier;
+      saveRounds();
+      const fresh = Object.values(INGREDIENTS).filter((i) => i.unlockRound > before && i.unlockRound <= rounds).map((i) => `${i.emoji} ${i.name}`);
+      if (fresh.length) toast(`New ingredient unlocked: ${fresh.join(", ")}!`);
+    }
+  };
+
+  // ---------- game actions ----------
+  function useIngredient(id) {
+    if (!state.running) return;
+    const prep = INGREDIENTS[id].prep;
+    if (prep === "none") state.tray.push(id);
+    else if (prep === "chop") {
+      if (state.board) return toast("Cutting board is busy");
+      state.board = { id, clicks: 0 };
+    } else if (prep === "cook") {
+      const key = ["pan", "torch"].find((k) => !state.cookers[k] && (k !== "torch" || INGREDIENTS[id].torch));
+      if (!key) return toast("Cookers are busy");
+      state.cookers[key] = { id, t: 0 };
+    }
+  }
+
+  function chopClick() {
+    const b = state.board;
+    if (!b || !state.running) return;
+    if (!state.knife) return toast("Pick up the knife first!");
+    if (++b.clicks >= CONFIG.chopClicks) {
+      state.tray.push(`${b.id}:chopped`);
+      state.board = null;
+    }
+  }
+
+  function takeFromCooker(key) {
+    const p = state.cookers[key];
+    if (!p || !state.running) return;
+    const r = p.t / COOKERS[key].seconds;
+    if (r >= GOOD_ZONE[0] && r <= GOOD_ZONE[1]) state.tray.push(`${p.id}:cooked`);
+    else toast(r < GOOD_ZONE[0] ? "Still raw — thrown away" : "Burnt!");
+    state.cookers[key] = null;
+  }
+
+  function spawnOrder() {
+    if (state.orders.length >= Math.min(CONFIG.maxOrders, SLOTS)) return;
+    const pool = availableRecipes();
+    const recipe = pool[Math.floor(Math.random() * pool.length)];
+    const used = new Set(state.orders.map((o) => o.slot));
+    const slot = [0, 1, 2, 3].find((s) => !used.has(s));
+    state.orders.push({ id: state.nextId++, slot, recipe, patience: CONFIG.orderPatienceSeconds });
+  }
+
+  function serve(order) {
+    if (!state.running) return;
+    const need = [...order.recipe.items].sort().join("|");
+    const have = [...state.tray].sort().join("|");
+    if (need === have) {
+      addScore(order.recipe.items.length * CONFIG.pointsPerItem + order.recipe.bonus);
+      state.orders = state.orders.filter((o) => o !== order);
+      toast(`Served ${order.recipe.name}!`);
+    } else {
+      addScore(-CONFIG.wrongPenalty);
+      toast("Wrong dish!");
+    }
+    state.tray = [];
+  }
+
+  function toggleKnife() {
+    if (!state.running) return;
+    state.knife = !state.knife;
+  }
+
+  function clearTray() {
+    if (!state.running) return;
+    state.tray = [];
+    toast("Tray cleared");
+  }
+
+  // ---------- drawing helpers ----------
+  const FONT = "system-ui, 'Segoe UI Emoji', 'Apple Color Emoji', 'Noto Color Emoji', sans-serif";
+  function txt(s, x, y, size, color, align = "center", weight = "bold", maxW) {
+    ctx.font = `${weight} ${size}px ${FONT}`;
+    ctx.textAlign = align; ctx.textBaseline = "middle"; ctx.fillStyle = color;
+    if (maxW) ctx.fillText(s, x, y, maxW); else ctx.fillText(s, x, y);
+  }
+  function rr(x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+  function ellipse(cx, cy, rx, ry, fill) {
+    ctx.beginPath(); ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2); ctx.fillStyle = fill; ctx.fill();
+  }
+  // register a clickable rectangle; returns true if the mouse is over it
+  function reg(x, y, w, h, act, lbl) {
+    hits.push({ x, y, w, h, act });
+    const over = mouse.inside && mouse.x >= x && mouse.x <= x + w && mouse.y >= y && mouse.y <= y + h;
+    if (over) hoverLabel = lbl;
+    return over;
+  }
+  function outline(x, y, w, h, over) {
+    if (!over) return;
+    ctx.strokeStyle = "#ffe14d"; ctx.lineWidth = 3; ctx.setLineDash([8, 5]);
+    ctx.strokeRect(x, y, w, h); ctx.setLineDash([]);
+  }
+  function cookBar(cx, y, wpx, r) {
+    const x = cx - wpx / 2, h = u * 2.2;
+    ctx.fillStyle = "#bbb"; ctx.fillRect(x, y, wpx * GOOD_ZONE[0], h);
+    ctx.fillStyle = "#4caf50"; ctx.fillRect(x + wpx * GOOD_ZONE[0], y, wpx * (GOOD_ZONE[1] - GOOD_ZONE[0]), h);
+    ctx.fillStyle = "#c0392b"; ctx.fillRect(x + wpx * GOOD_ZONE[1], y, wpx * (1 - GOOD_ZONE[1]), h);
+    ctx.strokeStyle = "#000"; ctx.lineWidth = 1; ctx.strokeRect(x, y, wpx, h);
+    ctx.fillStyle = "#000"; ctx.fillRect(x + wpx * r - 2, y - u * 0.6, 4, h + u * 1.2);
+  }
+
+  // ---------- scene ----------
+  function drawWindow() {
+    const x1 = sx(86), x2 = sx(138), y1 = u * 12, y2 = u * 52;
+    if (x2 < 0 || x1 > W) return;
+    ctx.fillStyle = "#8ec3e6"; ctx.fillRect(x1, y1, x2 - x1, y2 - y1);
+    ctx.fillStyle = "#6fa05a"; ctx.fillRect(x1, y2 - u * 6, x2 - x1, u * 6);
+    for (let a = 84, i = 0; a < 140; a += 4, i++) {
+      ctx.fillStyle = i % 2 ? "#ffffff" : "#d9423a";
+      ctx.fillRect(sx(a), u * 6, 4 * ppd + 1, u * 6.5);
+    }
+    // customers
+    for (const o of state.orders) {
+      const cx = sx(AT.window + (o.slot - 1.5) * 12);
+      const bw = ppd * 8, bodyH = u * 15, hs = u * 9, bodyY = y2 - bodyH, headY = bodyY - hs + u;
+      const ratio = o.patience / CONFIG.orderPatienceSeconds;
+      const angry = ratio < 0.35;
+      ctx.fillStyle = CUSTOMER_COLORS[o.id % CUSTOMER_COLORS.length]; ctx.fillRect(cx - bw / 2, bodyY, bw, bodyH);
+      ctx.fillStyle = angry ? "#e8907a" : SKIN; ctx.fillRect(cx - hs / 2, headY, hs, hs);
+      ctx.fillStyle = "#000";
+      ctx.fillRect(cx - hs * 0.28, headY + hs * 0.3, u * 1.2, u * 1.2);
+      ctx.fillRect(cx + hs * 0.28 - u * 1.2, headY + hs * 0.3, u * 1.2, u * 1.2);
+      ctx.beginPath(); ctx.lineWidth = 2; ctx.strokeStyle = "#000";
+      if (angry) ctx.arc(cx, headY + hs * 0.85, hs * 0.2, Math.PI * 1.1, Math.PI * 1.9);
+      else ctx.arc(cx, headY + hs * 0.6, hs * 0.2, Math.PI * 0.1, Math.PI * 0.9);
+      ctx.stroke();
+      // patience bar + speech bubble
+      const barY = headY - u * 2.6;
+      ctx.fillStyle = "#222"; ctx.fillRect(cx - bw / 2, barY, bw, u * 1.4);
+      ctx.fillStyle = ratio > 0.5 ? "#4caf50" : ratio > 0.25 ? "#f39c12" : "#e74c3c";
+      ctx.fillRect(cx - bw / 2, barY, bw * Math.max(0, ratio), u * 1.4);
+      rr(cx - bw * 0.7, u * 14, bw * 1.4, u * 8.5, 8); ctx.fillStyle = "#fff"; ctx.fill();
+      ctx.strokeStyle = "#444"; ctx.lineWidth = 1.5; ctx.stroke();
+      txt(o.recipe.name, cx, u * 18.2, u * 2.4, "#222", "center", "bold", bw * 1.3);
+      const over = reg(cx - bw / 2, headY - u * 3, bw, y2 - headY + u * 3, () => serve(o), `Serve ${o.recipe.name}`);
+      outline(cx - bw / 2, headY - u * 3, bw, y2 - headY + u * 3, over);
+    }
+    ctx.strokeStyle = "#7a4b22"; ctx.lineWidth = u * 1; ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+    txt("SERVE HERE", (x1 + x2) / 2, u * 9.2, u * 2.6, "#fff", "center", "bold");
+  }
+
+  function drawShelf() {
+    const x0 = sx(-94), x1 = sx(-46);
+    if (x1 < 0 || x0 > W) return;
+    ctx.fillStyle = "#7a4b22";
+    ctx.fillRect(x0, u * 31, x1 - x0, u * 1.2);
+    ctx.fillRect(x0, u * 49, x1 - x0, u * 1.2);
+    Object.keys(INGREDIENTS).forEach((id, i) => {
+      const col = i % 4, row = Math.floor(i / 4);
+      const cx = sx(AT.pantry + (col - 1.5) * 11);
+      const size = u * 13, x = cx - size / 2, y = (row ? u * 49 : u * 31) - size;
+      const ing = INGREDIENTS[id], ok = unlocked(id);
+      ctx.fillStyle = ok ? "#c9a066" : "#8d8d8d"; ctx.fillRect(x, y, size, size);
+      ctx.strokeStyle = "#6e4a26"; ctx.lineWidth = 2; ctx.strokeRect(x, y, size, size);
+      ctx.globalAlpha = ok ? 1 : 0.35;
+      txt(ing.emoji, cx, y + size * 0.42, size * 0.5, "#000", "center", "normal");
+      ctx.globalAlpha = 1;
+      txt(ok ? ing.name : `🔒 ${ing.unlockRound * CONFIG.pointsPerUnlock} pts`, cx, y + size * 0.86, u * 2, "#3a2a1a", "center", "bold", size * 0.95);
+      if (ok) outline(x, y, size, size, reg(x, y, size, size, () => useIngredient(id), `Grab ${ing.name}`));
+    });
+    txt("PANTRY", sx(AT.pantry), u * 7, u * 3, "#7a4b22", "center", "bold");
+  }
+
+  function drawBin() {
+    const cx = sx(AT.bin), w = ppd * 10, x = cx - w / 2, y = u * 62, h = u * 20;
+    if (cx + w < 0 || cx - w > W) return;
+    ctx.fillStyle = "#7f8c8d"; ctx.fillRect(x, y, w, h);
+    ctx.fillStyle = "#566061"; ctx.fillRect(x - u, y - u * 2, w + u * 2, u * 2.5);
+    txt("🗑", cx, y + h * 0.5, u * 7, "#000", "center", "normal");
+    outline(x, y - u * 2, w, h + u * 2, reg(x, y - u * 2, w, h + u * 2, clearTray, "Clear tray"));
+  }
+
+  function drawBoard() {
+    const cx = sx(AT.board);
+    if (cx + 15 * ppd < 0 || cx - 15 * ppd > W) return;
+    const backY = u * 60, frontY = u * 80;
+    ctx.beginPath();
+    ctx.moveTo(cx - 10 * ppd, backY); ctx.lineTo(cx + 10 * ppd, backY);
+    ctx.lineTo(cx + 13 * ppd, frontY); ctx.lineTo(cx - 13 * ppd, frontY); ctx.closePath();
+    ctx.fillStyle = "#e0b87e"; ctx.fill(); ctx.strokeStyle = "#8a5a2b"; ctx.lineWidth = 3; ctx.stroke();
+    ctx.strokeStyle = "rgba(120,80,30,.35)"; ctx.lineWidth = 1;
+    for (let k = -1; k <= 1; k++) { ctx.beginPath(); ctx.moveTo(cx + k * 5 * ppd, backY + 4); ctx.lineTo(cx + k * 6.5 * ppd, frontY - 4); ctx.stroke(); }
+    const b = state.board;
+    if (b) {
+      txt(INGREDIENTS[b.id].emoji, cx, u * 66, u * 9, "#000", "center", "normal");
+      if (state.knife) txt(`Chop! ${b.clicks}/${CONFIG.chopClicks}`, cx, u * 76, u * 3.2, "#5a3410", "center", "bold");
+      outline(cx - 13 * ppd, u * 58, 26 * ppd, u * 23, reg(cx - 13 * ppd, u * 58, 26 * ppd, u * 23, chopClick, `Chop (${b.clicks}/${CONFIG.chopClicks})`));
+    } else {
+      txt("Cutting board", cx, u * 72, u * 2.6, "rgba(90,52,16,.6)", "center", "bold");
+    }
+    // knife resting on the counter between the board and the pan
+    const kx = sx(AT.board + 23), ky = u * 76;
+    if (state.knife) {
+      ctx.setLineDash([5, 4]); ctx.strokeStyle = "rgba(60,40,15,.5)"; ctx.lineWidth = 2;
+      ctx.strokeRect(kx - 4 * ppd, ky - u * 1.8, 8 * ppd, u * 3.6); ctx.setLineDash([]);
+      txt("knife rest", kx, ky, u * 1.8, "rgba(60,40,15,.55)", "center", "bold");
+    } else {
+      ctx.fillStyle = "#cfd8dc"; ctx.beginPath();
+      ctx.moveTo(kx - 4 * ppd, ky - u * 1.2); ctx.lineTo(kx + 1.5 * ppd, ky - u * 1.2);
+      ctx.lineTo(kx + 2.5 * ppd, ky + u * 0.2); ctx.lineTo(kx - 4 * ppd, ky + u * 1.2); ctx.closePath(); ctx.fill();
+      ctx.strokeStyle = "#78909c"; ctx.lineWidth = 1.5; ctx.stroke();
+      ctx.fillStyle = "#6b4a2a"; ctx.fillRect(kx + 2.5 * ppd, ky - u * 1, 4 * ppd, u * 2);
+    }
+    const kw = 11 * ppd, kh = u * 6;
+    outline(kx - 4.5 * ppd, ky - u * 3, kw, kh, reg(kx - 4.5 * ppd, ky - u * 3, kw, kh, toggleKnife, state.knife ? "Put knife back" : "Pick up knife"));
+    if (b && !state.knife) txt("Need the knife!", cx, u * 76, u * 3, "#a33", "center", "bold");
+  }
+
+  function drawPan(t) {
+    const cx = sx(AT.pan);
+    if (cx + 22 * ppd < 0 || cx - 14 * ppd > W) return;
+    const c = state.cookers.pan;
+    ellipse(cx, u * 74, 12 * ppd, 5 * u, "#3a3a3a");
+    ctx.fillStyle = "#2b2b2b"; ctx.fillRect(cx - 12 * ppd, u * 74, 24 * ppd, u * 9);
+    ellipse(cx - 6 * ppd, u * 80, u * 1.2, u * 1.2, "#aaa"); ellipse(cx + 6 * ppd, u * 80, u * 1.2, u * 1.2, "#aaa");
+    ctx.fillStyle = "#111"; ctx.fillRect(cx + 9 * ppd, u * 70.5, 10 * ppd, u * 2);
+    ellipse(cx, u * 72, 9 * ppd, 4 * u, "#1c1c1c"); ellipse(cx, u * 71.5, 8 * ppd, 3.2 * u, "#333");
+    txt("PAN", cx, u * 78.5, u * 2.4, "#bbb", "center", "bold");
+    if (!c) return;
+    const r = c.t / COOKERS.pan.seconds;
+    txt(INGREDIENTS[c.id].emoji, cx, u * 65.5, u * 9, "#000", "center", "normal");
+    if (r > GOOD_ZONE[1]) txt("💨", cx + 3 * ppd, u * 59 + Math.sin(t * 6) * 3, u * 5, "#000", "center", "normal");
+    cookBar(cx, u * 54, 22 * ppd, r);
+    const ready = r >= GOOD_ZONE[0] && r <= GOOD_ZONE[1];
+    if (ready) { ctx.strokeStyle = `rgba(76,175,80,${0.5 + 0.5 * Math.sin(t * 8)})`; ctx.lineWidth = 4; ctx.beginPath(); ctx.ellipse(cx, u * 72, 9.6 * ppd, 4.6 * u, 0, 0, Math.PI * 2); ctx.stroke(); }
+    outline(cx - 12 * ppd, u * 52, 31 * ppd, u * 32, reg(cx - 12 * ppd, u * 52, 31 * ppd, u * 32, () => takeFromCooker("pan"), "Take out"));
+  }
+
+  function drawTorch(t) {
+    const cx = sx(AT.torch);
+    if (cx + 18 * ppd < 0 || cx - 12 * ppd > W) return;
+    const c = state.cookers.torch;
+    ellipse(cx, u * 75, 9 * ppd, 3.5 * u, "#d5d8dc"); ellipse(cx, u * 74.6, 8 * ppd, 2.9 * u, "#eceff1");
+    ctx.fillStyle = "#c0392b"; ctx.fillRect(cx + 10 * ppd, u * 58, 6 * ppd, u * 21);
+    ctx.fillStyle = "#555"; ctx.fillRect(cx + 10.5 * ppd, u * 55.5, 5 * ppd, u * 3);
+    ctx.fillStyle = "#444"; ctx.fillRect(cx + 4 * ppd, u * 66, 6.5 * ppd, u * 2);
+    txt("TORCH", cx + 13 * ppd, u * 69, u * 2, "#fff", "center", "bold", 5.5 * ppd);
+    if (!c) return;
+    const r = c.t / COOKERS.torch.seconds;
+    txt(INGREDIENTS[c.id].emoji, cx, u * 68, u * 8, "#000", "center", "normal");
+    const fl = 1 + 0.25 * Math.sin(t * 40);
+    ctx.fillStyle = "#ff9800"; ctx.beginPath(); ctx.moveTo(cx + 4 * ppd, u * 67); ctx.lineTo(cx + 4 * ppd - 8 * ppd * fl, u * 65.5); ctx.lineTo(cx + 4 * ppd - 8 * ppd * fl, u * 68.5); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = "#ffee58"; ctx.beginPath(); ctx.moveTo(cx + 4 * ppd, u * 67); ctx.lineTo(cx + 4 * ppd - 4.5 * ppd * fl, u * 66.2); ctx.lineTo(cx + 4 * ppd - 4.5 * ppd * fl, u * 67.8); ctx.closePath(); ctx.fill();
+    cookBar(cx, u * 54, 18 * ppd, r);
+    outline(cx - 10 * ppd, u * 52, 26 * ppd, u * 30, reg(cx - 10 * ppd, u * 52, 26 * ppd, u * 30, () => takeFromCooker("torch"), "Take out"));
+  }
+
+  function drawTray() {
+    const top = H * 0.86, w = Math.min(W * 0.6, 640), x = W / 2 - w / 2, y = top + u, h = H - y - u;
+    rr(x, y, w, h, 10); ctx.fillStyle = "#9aa5ab"; ctx.fill();
+    rr(x + 6, y + 6, w - 12, h - 12, 8); ctx.fillStyle = "#cfd8dc"; ctx.fill();
+    txt("TRAY", x + 16, y + 16, u * 2.2, "#607078", "left", "bold");
+    if (!state.tray.length) { txt("empty", W / 2, y + h / 2, u * 3, "rgba(60,70,75,.5)", "center", "bold"); return; }
+    let cxp = x + 14, cyp = y + h * 0.58;
+    const size = Math.max(11, u * 2.6);
+    ctx.font = `bold ${size}px ${FONT}`;
+    for (const key of state.tray) {
+      const s = label(key), cw = ctx.measureText(s).width + 16;
+      if (cxp + cw > x + w - 10) { cxp = x + 14; cyp += size * 2; }
+      rr(cxp, cyp - size, cw, size * 2, 8); ctx.fillStyle = "#ffe9c7"; ctx.fill();
+      txt(s, cxp + cw / 2, cyp, size, "#3a2a1a", "center", "bold");
+      cxp += cw + 6;
+    }
+  }
+
+  function drawHands() {
+    const rightX = mouse.inside ? Math.max(W * 0.6, Math.min(W * 0.95, mouse.x)) : W * 0.88;
+    const hand = (cx, lift, knife) => {
+      const w = Math.min(W * 0.07, 90), y = H - u * 10 - lift;
+      ctx.fillStyle = "#2f6fb0"; ctx.fillRect(cx - w * 0.45, y + u * 6, w * 0.9, H);
+      if (knife) {
+        ctx.fillStyle = "#cfd8dc"; ctx.fillRect(cx - u * 1, y - u * 12, u * 2.6, u * 14);
+        ctx.fillStyle = "#6b4a2a"; ctx.fillRect(cx - u * 1.2, y + u * 1, u * 3, u * 3);
+      }
+      rr(cx - w / 2, y, w, u * 8, w * 0.3); ctx.fillStyle = SKIN; ctx.fill();
+      ctx.strokeStyle = "rgba(0,0,0,.25)"; ctx.lineWidth = 1.5; ctx.stroke();
+    };
+    hand(W * 0.12, 0, false);
+    hand(rightX, kick * u * 6, state.knife);
+  }
+
+  function drawOrdersHud() {
+    const n = state.orders.length;
+    if (!n) return;
+    const cw = Math.min(170, (W - 20) / SLOTS - 6), ch = 52;
+    [...state.orders].sort((a, b) => a.slot - b.slot).forEach((o, i) => {
+      const x = 10 + i * (cw + 6), y = u * 4;
+      rr(x, y, cw, ch, 8); ctx.fillStyle = "rgba(255,255,255,.92)"; ctx.fill();
+      ctx.strokeStyle = CUSTOMER_COLORS[o.id % CUSTOMER_COLORS.length]; ctx.lineWidth = 3; ctx.stroke();
+      txt(o.recipe.name, x + 8, y + 12, 13, "#222", "left", "bold", cw - 16);
+      const items = o.recipe.items.map((it) => {
+        const [id, st] = it.split(":");
+        return INGREDIENTS[id].emoji + (st === "cooked" ? "🔥" : st === "chopped" ? "🔪" : "");
+      }).join(" ");
+      txt(items, x + 8, y + 31, 15, "#222", "left", "normal", cw - 16);
+      ctx.fillStyle = "#ddd"; ctx.fillRect(x + 8, y + ch - 9, cw - 16, 5);
+      const ratio = Math.max(0, o.patience / CONFIG.orderPatienceSeconds);
+      ctx.fillStyle = ratio > 0.5 ? "#4caf50" : ratio > 0.25 ? "#f39c12" : "#e74c3c";
+      ctx.fillRect(x + 8, y + ch - 9, (cw - 16) * ratio, 5);
+    });
+  }
+
+  function draw(t) {
+    hits = []; hoverLabel = "";
+    const wallB = H * 0.52, counterB = H * 0.86;
+    // wall
+    ctx.fillStyle = "#e8d9b5"; ctx.fillRect(0, 0, W, wallB);
+    ctx.strokeStyle = "rgba(90,60,30,.10)"; ctx.lineWidth = 1;
+    for (let a = -200; a <= 220; a += 8) { const x = sx(a); if (x < -2 || x > W + 2) continue; ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, wallB); ctx.stroke(); }
+    for (let y = u * 6; y < wallB; y += u * 7) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
+    ctx.fillStyle = "#b59a70"; ctx.fillRect(0, 0, W, u * 3);
+    drawWindow();
+    drawShelf();
+    // counter
+    const g = ctx.createLinearGradient(0, wallB, 0, counterB);
+    g.addColorStop(0, "#c28f55"); g.addColorStop(1, "#8c5f2f");
+    ctx.fillStyle = g; ctx.fillRect(0, wallB, W, counterB - wallB);
+    ctx.fillStyle = "#5a3b1c"; ctx.fillRect(0, wallB, W, 3);
+    ctx.strokeStyle = "rgba(0,0,0,.12)";
+    for (let a = -200; a <= 220; a += 10) { const x = sx(a); if (x < -2 || x > W + 2) continue; ctx.beginPath(); ctx.moveTo(x, wallB); ctx.lineTo(x, counterB); ctx.stroke(); }
+    ctx.fillStyle = "#4a3018"; ctx.fillRect(0, counterB, W, H - counterB);
+    drawBin(); drawBoard(); drawPan(t); drawTorch(t);
+    drawTray(); drawOrdersHud(); drawHands();
+    if (hoverLabel) {
+      ctx.font = `bold 14px ${FONT}`;
+      const tw = ctx.measureText(hoverLabel).width + 16;
+      const tx = Math.min(mouse.x + 14, W - tw - 4), ty = Math.max(4, mouse.y - 34);
+      rr(tx, ty, tw, 26, 6); ctx.fillStyle = "rgba(20,12,4,.85)"; ctx.fill();
+      txt(hoverLabel, tx + tw / 2, ty + 13, 14, "#fff", "center", "bold");
+    }
+    cv.style.cursor = hoverLabel ? "pointer" : "default";
+  }
+
+  // ---------- loop ----------
+  let last = performance.now();
+  function frame(now) {
+    const dt = Math.min((now - last) / 1000, 0.1);
+    last = now;
+    update(dt);
+    draw(now / 1000);
+    requestAnimationFrame(frame);
+  }
+
+  function update(dt) {
+    // camera
+    let turn = 0;
+    if (keys.left) turn -= 1;
+    if (keys.right) turn += 1;
+    if (mouse.inside) {
+      const e = W * 0.1;
+      if (mouse.x < e) turn -= 1 - mouse.x / e;
+      else if (mouse.x > W - e) turn += 1 - (W - mouse.x) / e;
+    }
+    if (turn) { yaw += turn * 90 * dt; yawTarget = null; }
+    else if (yawTarget !== null) {
+      yaw += (yawTarget - yaw) * Math.min(1, dt * 8);
+      if (Math.abs(yawTarget - yaw) < 0.05) { yaw = yawTarget; yawTarget = null; }
+    }
+    yaw = clampYaw(yaw);
+    kick = Math.max(0, kick - dt * 5);
+
+    $("score").textContent = state.score;
+    if (!state.running) return;
+
+    spawnTimer -= dt;
+    if (spawnTimer <= 0) { spawnOrder(); spawnTimer = CONFIG.orderEverySeconds; }
+
+    for (const o of [...state.orders]) {
+      o.patience -= dt;
+      if (o.patience <= 0) {
+        state.orders = state.orders.filter((x) => x !== o);
+        addScore(-CONFIG.wrongPenalty);
+        toast(`${o.recipe.name} order expired`);
+      }
+    }
+    for (const key of Object.keys(COOKERS)) {
+      const c = state.cookers[key];
+      if (c) c.t = Math.min(c.t + dt, COOKERS[key].seconds);
+    }
+  }
+
+  function startGame() {
+    Object.assign(state, { running: true, knife: false, score: 0, orders: [], tray: [], board: null, cookers: { pan: null, torch: null } });
+    spawnTimer = 0;
+    yaw = 0; yawTarget = AT.board;
+    $("overlay").classList.add("hidden");
+  }
+
+  // ---------- input ----------
+  function setMouse(e) {
+    const r = cv.getBoundingClientRect();
+    mouse.x = e.clientX - r.left; mouse.y = e.clientY - r.top; mouse.inside = true;
+  }
+  cv.addEventListener("pointermove", setMouse);
+  cv.addEventListener("pointerleave", () => { mouse.inside = false; });
+  cv.addEventListener("pointerdown", (e) => {
+    setMouse(e);
+    if (!state.running) return;
+    for (let i = hits.length - 1; i >= 0; i--) {
+      const h = hits[i];
+      if (mouse.x >= h.x && mouse.x <= h.x + h.w && mouse.y >= h.y && mouse.y <= h.y + h.h) { h.act(); kick = 1; return; }
+    }
+  });
+
+  addEventListener("keydown", (e) => {
+    const k = e.key.toLowerCase();
+    if (k === "a" || k === "arrowleft") { keys.left = true; yaw = clampYaw(yaw - 3); yawTarget = null; e.preventDefault(); }
+    else if (k === "d" || k === "arrowright") { keys.right = true; yaw = clampYaw(yaw + 3); yawTarget = null; e.preventDefault(); }
+    else if (k in SPOTS) yawTarget = SPOTS[k];
+    else if (k === "c") clearTray();
+  });
+  addEventListener("keyup", (e) => {
+    const k = e.key.toLowerCase();
+    if (k === "a" || k === "arrowleft") keys.left = false;
+    if (k === "d" || k === "arrowright") keys.right = false;
+  });
+  $("nav").addEventListener("click", (e) => {
+    const b = e.target.closest("button");
+    if (b) yawTarget = SPOTS[b.dataset.key];
+  });
+  $("start").onclick = startGame;
+  $("start-top").onclick = startGame;
+
+  function resize() {
+    const r = $("wrap").getBoundingClientRect();
+    dpr = window.devicePixelRatio || 1;
+    W = Math.max(1, r.width); H = Math.max(1, r.height);
+    cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ppd = W / FOV; u = H / 100;
+  }
+  new ResizeObserver(resize).observe($("wrap"));
+  addEventListener("resize", resize);
+  resize();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
